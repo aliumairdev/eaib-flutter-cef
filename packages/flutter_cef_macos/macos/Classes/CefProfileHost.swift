@@ -411,7 +411,12 @@ final class CefProfileHost {
   /// exit), close the fds, unlink the socket, drop an ephemeral profile dir, and
   /// terminate cef_host. Closing an fd a thread is blocked on, or freeing state
   /// under the reader, is a use-after-free — the join makes teardown deterministic.
-  func shutdown() {
+  ///
+  /// [graceSeconds] > 0 gives cef_host that long to exit on its own after
+  /// kOpShutdown before it is SIGTERMed. CEF persists its cookie store (and the
+  /// rest of the profile) while it shuts down, and a SIGTERM straight after
+  /// kOpShutdown cuts that short, which loses cookies set in the last ~30 s.
+  func shutdown(graceSeconds: TimeInterval = 0) {
     // Clear `running` FIRST (before the kOpShutdown write and before closing the
     // fds): this is a CLEAN teardown, so neither the reader's read-EOF nor a
     // failed kOpShutdown write should be mistaken for a crash — handleHostDeath()
@@ -471,13 +476,38 @@ final class CefProfileHost {
     // CDP reader is blocked in read() on would be a use-after-free, so the SAME
     // discipline as the IPC reader applies: get the reader to EOF first (the
     // child exiting closes its fd 4), JOIN it, THEN close the read fd.
-    cdpWriteLock.lock()
-    if cdpWriteFd >= 0 { close(cdpWriteFd); cdpWriteFd = -1 }
-    cdpWriteLock.unlock()
-    // terminateProcess() (SIGTERM, SIGKILL escalation) makes the child exit,
-    // which closes its CDP write end (fd 4) and yields EOF on cdpReadFd so the
-    // CDP reader loop returns. Done before the CDP reader join for that reason.
-    terminateProcess()
+    let closeCdpWrite = { [self] in
+      cdpWriteLock.lock()
+      if cdpWriteFd >= 0 { close(cdpWriteFd); cdpWriteFd = -1 }
+      cdpWriteLock.unlock()
+    }
+    // Same discipline for the CDP reader — gate on cdpReaderStarted alone, and
+    // never close the read fd on a join timeout (the reader is still in read() on it).
+    let joinCdpReader = { [self] in
+      let cdpJoined = !cdpReaderStarted || cdpReaderDone.wait(timeout: .now() + 2) == .success
+      if cdpReadFd >= 0 { if cdpJoined { close(cdpReadFd) }; cdpReadFd = -1 }
+    }
+    let plan = HostShutdownPolicy.plan(
+      graceSeconds: graceSeconds, hasCdpPipe: cdpWriteFd >= 0 || cdpReadFd >= 0,
+      hostPid: exitingPid)
+    switch plan {
+    case .terminateNow, .terminateAfterGrace:
+      closeCdpWrite()
+      // terminateProcess() (SIGTERM, SIGKILL escalation) makes the child exit,
+      // which closes its CDP write end (fd 4) and yields EOF on cdpReadFd so the
+      // CDP reader loop returns. Done before the CDP reader join for that reason.
+      terminateProcess(graceSeconds: plan == .terminateNow ? 0 : graceSeconds)
+    case .closeCdpAfterExit:
+      // The EOF on the CDP pipe makes cef_host quit at once, without persisting
+      // its cookie store, so it is held back until cef_host has exited on its
+      // own. That wait, and the CDP teardown after it, run off this thread.
+      DispatchQueue.global().async {
+        Self.waitForExit(exitingPid, timeout: graceSeconds)
+        closeCdpWrite()
+        self.terminateProcess()
+        joinCdpReader()
+      }
+    }
     surfacePort?.close()
     if isEphemeral && !profileDir.isEmpty {
       let dir = profileDir
@@ -486,16 +516,16 @@ final class CefProfileHost {
         try? FileManager.default.removeItem(atPath: dir)
       }
     }
-    // Same discipline for the CDP reader — gate on cdpReaderStarted alone, and
-    // never close the read fd on a join timeout (the reader is still in read() on it).
-    let cdpJoined = !cdpReaderStarted || cdpReaderDone.wait(timeout: .now() + 2) == .success
-    if cdpReadFd >= 0 { if cdpJoined { close(cdpReadFd) }; cdpReadFd = -1 }
+    if plan != .closeCdpAfterExit { joinCdpReader() }
   }
 
   /// SIGTERM (then SIGKILL escalation) the cef_host process. Handles BOTH launch
   /// paths: `process` (Foundation.Process, default) and `spawnedPid` (posix_spawn,
   /// agent-control). Idempotent — clears whichever handle it used.
-  private func terminateProcess() {
+  ///
+  /// With [graceSeconds] > 0 the SIGTERM waits that long for the host to exit by
+  /// itself (it was already sent kOpShutdown), and goes out only if it has not.
+  private func terminateProcess(graceSeconds: TimeInterval = 0) {
     // Take BOTH handles atomically under writeLock so this is the sole owner of
     // its terminate/waitpid — handleHostDeath's reaper can't be reaping the same pid
     // concurrently (it took ownership the same way, or handed it back to us).
@@ -503,11 +533,22 @@ final class CefProfileHost {
     let p = process; process = nil
     let pid = spawnedPid; spawnedPid = 0
     writeLock.unlock()
+    // SIGTERM now, or once the grace period has run out with the host still up.
+    let afterGrace: (@escaping () -> Void) -> Void = { work in
+      if graceSeconds > 0 {
+        DispatchQueue.global().asyncAfter(deadline: .now() + graceSeconds, execute: work)
+      } else {
+        work()
+      }
+    }
     if let p = p {
-      p.terminate()  // SIGTERM
-      // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
-      DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
-        if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+      afterGrace {
+        guard p.isRunning else { return }
+        p.terminate()  // SIGTERM
+        // Escalate to SIGKILL if the host is wedged and ignores SIGTERM.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+          if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        }
       }
       return
     }
@@ -515,13 +556,18 @@ final class CefProfileHost {
     // Reap with a non-blocking waitpid so the child doesn't linger as a zombie
     // (Foundation.Process reaps for us; for a bare pid we must do it ourselves).
     guard pid > 0 else { return }
-    kill(pid, SIGTERM)
-    DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+    afterGrace {
       var status: Int32 = 0
-      // If it already exited, waitpid reaps it now; if not, SIGKILL then reap.
-      if waitpid(pid, &status, WNOHANG) == 0 {
-        kill(pid, SIGKILL)
-        _ = waitpid(pid, &status, 0)
+      // Exited on its own within the grace period: reaping it is all that is left.
+      if graceSeconds > 0, waitpid(pid, &status, WNOHANG) != 0 { return }
+      kill(pid, SIGTERM)
+      DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+        var status: Int32 = 0
+        // If it already exited, waitpid reaps it now; if not, SIGKILL then reap.
+        if waitpid(pid, &status, WNOHANG) == 0 {
+          kill(pid, SIGKILL)
+          _ = waitpid(pid, &status, 0)
+        }
       }
     }
   }

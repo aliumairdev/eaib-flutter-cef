@@ -262,6 +262,22 @@ CefWebView(url: startUrl, controller: c);
   authors), give each its own `profile`, or use the ephemeral default — each
   gets its own process, cookie jar, and channel namespace.
 
+### When cookies reach disk
+
+Chromium writes a cookie to the profile's `Cookies` database in batches, about
+30 s after it is set (a login can take that long to land). On macOS the cookies
+are written for sure when `cef_host` shuts itself down, so the plugin gives it
+time to: when the last view of a named profile is disposed, and when the app
+quits (`NSApplicationWillTerminate`, as from `SystemNavigator.pop()` or Cmd-Q),
+it sends the shutdown request and waits up to 8 s for `cef_host` to exit by
+itself before it SIGTERMs it. With `agentControl` the pipe to the host stays
+open until then, because closing it makes the host quit at once.
+
+Not covered: a force-quit, a crash of the app, or a `kill -9`. A cookie set in
+the last ~30 s before one of those can be lost. There is no `flushStore()` yet;
+it needs a new request in `cef_host` (`CefCookieManager::FlushStore`), which
+only takes effect in a `cef_host` you build and publish yourself.
+
 ### Secrets at rest
 
 Cookies (and Chromium's password / OSCrypt-encrypted data) are only encrypted

@@ -1,5 +1,11 @@
 ## Unreleased
 
+* Fix: on macOS, a cookie set shortly before the last view of a named profile
+  was disposed, or before the app quit, was lost. `cef_host` persists its
+  cookie store while it shuts itself down, and the plugin SIGTERMed it right
+  after asking it to (and, with `agentControl`, closed the CDP pipe, which
+  makes the host quit at once). It now gives the host up to 8 s to exit on its
+  own first. A force-quit or crash still loses the cookies of the last ~30 s.
 * Fix: on macOS, a resize could wait a second or more for its first paint at
   the new size (up to about 4 s), most often mid-way through an animated device
   switch. CEF paints by capturing the view: the renderer's first frame at the

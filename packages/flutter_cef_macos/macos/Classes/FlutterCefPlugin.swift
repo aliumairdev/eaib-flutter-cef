@@ -108,9 +108,15 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     // De-dup: several sessions can share one host (one named profile -> one host).
     var seen = Set<ObjectIdentifier>()
+    var exiting: [pid_t] = []
     for host in profiles.values where seen.insert(ObjectIdentifier(host)).inserted {
-      host.shutdown()
+      // A throwaway profile is deleted anyway, so only a named one is waited for.
+      if !host.isEphemeral { exiting.append(host.hostPid()) }
+      host.shutdown(graceSeconds: host.isEphemeral ? 0 : HostShutdownPolicy.graceSeconds)
     }
+    // Hold the app open (bounded) while each named profile's host persists it: a
+    // host SIGTERMed mid-shutdown loses the cookies set in the last ~30 s.
+    for pid in exiting { CefProfileHost.waitForExit(pid, timeout: HostShutdownPolicy.graceSeconds) }
     profiles.removeAll()
     sessions.removeAll()
   }
@@ -898,7 +904,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let remaining = host.removeBrowser(session.browserId)
     if remaining == 0 {
       noteShuttingDown(host, key: key)
-      host.shutdown()
+      host.shutdown(graceSeconds: host.isEphemeral ? 0 : HostShutdownPolicy.graceSeconds)
       session.dispose()
       if let key = key { profiles[key] = nil }
     } else {
