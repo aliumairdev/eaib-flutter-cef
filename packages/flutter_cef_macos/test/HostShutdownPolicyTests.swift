@@ -23,8 +23,10 @@ enum HostShutdownPolicyTests {
           HostShutdownPolicy.plan(graceSeconds: 8, hasCdpPipe: false, hostPid: 10) == .terminateAfterGrace)
     check("grace with a CDP pipe → close the pipe only after the host exits",
           HostShutdownPolicy.plan(graceSeconds: 8, hasCdpPipe: true, hostPid: 10) == .closeCdpAfterExit)
-    check("grace with a CDP pipe but no pid to wait on → SIGTERM after the grace period",
-          HostShutdownPolicy.plan(graceSeconds: 8, hasCdpPipe: true, hostPid: 0) == .terminateAfterGrace)
+    check("grace with a CDP pipe but no pid to wait on → terminate now",
+          HostShutdownPolicy.plan(graceSeconds: 8, hasCdpPipe: true, hostPid: 0) == .terminateNow)
+    check("grace, no CDP pipe and no pid → terminate now",
+          HostShutdownPolicy.plan(graceSeconds: 8, hasCdpPipe: false, hostPid: 0) == .terminateNow)
     check("the default grace outlasts the host's 6 s hard-exit deadline",
           HostShutdownPolicy.graceSeconds > 6)
     if failures > 0 { print("\(failures) FAILED"); exit(1) }

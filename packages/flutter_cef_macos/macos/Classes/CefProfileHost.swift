@@ -86,6 +86,7 @@ final class CefProfileHost {
   // out_pipe[0] (we read CDP here; child writes it on fd 4). -1 when unused.
   var cdpWriteFd: Int32 = -1
   var cdpReadFd: Int32 = -1
+  var cdpTeardownScheduled = false  // under cdpWriteLock: a graceful shutdown queued the CDP teardown
   let cdpWriteLock = NSLock()  // serializes send(json) writes to cdpWriteFd
   var cdpReaderStarted = false
   // Signaled when the CDP reader thread exits, so shutdown() can join it before
@@ -498,6 +499,12 @@ final class CefProfileHost {
       // CDP reader loop returns. Done before the CDP reader join for that reason.
       terminateProcess(graceSeconds: plan == .terminateNow ? 0 : graceSeconds)
     case .closeCdpAfterExit:
+      // A second shutdown() must not queue a second teardown of the same fds.
+      cdpWriteLock.lock()
+      let alreadyScheduled = cdpTeardownScheduled
+      cdpTeardownScheduled = true
+      cdpWriteLock.unlock()
+      if alreadyScheduled { break }
       // The EOF on the CDP pipe makes cef_host quit at once, without persisting
       // its cookie store, so it is held back until cef_host has exited on its
       // own. That wait, and the CDP teardown after it, run off this thread.
@@ -558,8 +565,8 @@ final class CefProfileHost {
     guard pid > 0 else { return }
     afterGrace {
       var status: Int32 = 0
-      // Exited on its own within the grace period: reaping it is all that is left.
-      if graceSeconds > 0, waitpid(pid, &status, WNOHANG) != 0 { return }
+      // Already exited (on its own, within a grace period): reaping it is all that is left.
+      if waitpid(pid, &status, WNOHANG) != 0 { return }
       kill(pid, SIGTERM)
       DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
         var status: Int32 = 0

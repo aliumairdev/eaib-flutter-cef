@@ -13,13 +13,14 @@ import Foundation
 
 enum HostShutdownPolicy {
   /// How long cef_host is left to exit by itself after kOpShutdown. Its own
-  /// hard-exit deadline is 6 s, so it is gone before this runs out.
+  /// hard-exit deadline is 6 s (kHardExitSeconds in host_state.mm), so it is gone
+  /// before this runs out; keep this above that.
   static let graceSeconds: TimeInterval = 8
 
   enum Plan: Equatable {
     /// Close the CDP pipe and SIGTERM straight away.
     case terminateNow
-    /// No CDP pipe: SIGTERM only if the host is still up after the grace period.
+    /// A live host and no CDP pipe: SIGTERM only if the host is still up after the grace period.
     case terminateAfterGrace
     /// CDP pipe open: close it, and SIGTERM, only once the host has exited or the
     /// grace period is up.
@@ -27,8 +28,8 @@ enum HostShutdownPolicy {
   }
 
   static func plan(graceSeconds: TimeInterval, hasCdpPipe: Bool, hostPid: Int32) -> Plan {
-    if graceSeconds <= 0 { return .terminateNow }
-    if hasCdpPipe && hostPid > 0 { return .closeCdpAfterExit }
-    return .terminateAfterGrace
+    // No process to wait for (never spawned, or already reaped): nothing to grace.
+    if graceSeconds <= 0 || hostPid <= 0 { return .terminateNow }
+    return hasCdpPipe ? .closeCdpAfterExit : .terminateAfterGrace
   }
 }
