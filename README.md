@@ -266,7 +266,7 @@ CefWebView(url: startUrl, controller: c);
 
 Chromium writes a cookie to the profile's `Cookies` database in batches, about
 30 s after it is set (a login can take that long to land). On macOS the cookies
-are written for sure when `cef_host` shuts itself down, so the plugin gives it
+are written when `cef_host` shuts itself down, so the plugin gives it
 time to: when the last view of a named profile is disposed, and when the app
 quits (`NSApplicationWillTerminate`, as from `SystemNavigator.pop()` or Cmd-Q),
 it sends the shutdown request and waits up to 8 s for `cef_host` to exit by
