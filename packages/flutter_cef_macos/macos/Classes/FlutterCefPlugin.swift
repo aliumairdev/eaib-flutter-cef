@@ -108,8 +108,22 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     }
     // De-dup: several sessions can share one host (one named profile -> one host).
     var seen = Set<ObjectIdentifier>()
+    var exiting: [pid_t] = []
     for host in profiles.values where seen.insert(ObjectIdentifier(host)).inserted {
-      host.shutdown()
+      // A throwaway profile is deleted anyway, so only a named one is waited for.
+      if !host.isEphemeral { exiting.append(host.hostPid()) }
+      host.shutdown(graceSeconds: host.isEphemeral ? 0 : HostShutdownPolicy.graceSeconds)
+    }
+    // Hosts of named profiles disposed a moment ago are still persisting theirs.
+    exiting.append(contentsOf: exitingNamedHosts.values.map { $0.pid })
+    // Hold the app open while each named profile's host persists it: a host ended
+    // mid-shutdown loses the cookies set in the last ~30 s. One deadline for all of
+    // them, and a host still up at it is killed here, as nothing is left to do that
+    // once the app has quit.
+    let deadline = Date().addingTimeInterval(HostShutdownPolicy.graceSeconds)
+    for pid in exiting where pid > 0 {
+      CefProfileHost.waitForExit(pid, timeout: max(0, deadline.timeIntervalSinceNow))
+      if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
     }
     profiles.removeAll()
     sessions.removeAll()
@@ -655,12 +669,12 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
       // recreating on a host that can't start.
       if status == 2, let key = self.profiles.first(where: { $0.value === host })?.key,
          let prev = self.exitingNamedHosts.removeValue(forKey: key),
-         Date().timeIntervalSince(prev.at) < 10 {
+         Date().timeIntervalSince(prev.at) < HostShutdownPolicy.graceSeconds + 4 {
         // The lock is probably held by our own previous host of this profile, still
         // exiting: start this one again once that has gone, rather than report
         // "locked" for a profile no other app has open.
         DispatchQueue.global().async {
-          CefProfileHost.waitForExit(prev.pid, timeout: 3)
+          CefProfileHost.waitForExit(prev.pid, timeout: HostShutdownPolicy.graceSeconds + 2)
           DispatchQueue.main.async { [weak self] in
             self?.respawnNamedHost(host, key: key)
           }
@@ -898,7 +912,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let remaining = host.removeBrowser(session.browserId)
     if remaining == 0 {
       noteShuttingDown(host, key: key)
-      host.shutdown()
+      host.shutdown(graceSeconds: host.isEphemeral ? 0 : HostShutdownPolicy.graceSeconds)
       session.dispose()
       if let key = key { profiles[key] = nil }
     } else {
@@ -929,7 +943,7 @@ public class FlutterCefPlugin: NSObject, FlutterPlugin {
     let remaining = host.removeBrowser(session.browserId)
     if remaining == 0 {
       noteShuttingDown(host, key: key)
-      host.shutdown()
+      host.shutdown(graceSeconds: host.isEphemeral ? 0 : HostShutdownPolicy.graceSeconds)
       if let key = key { profiles[key] = nil }
     }
     session.detachForFreeze()
