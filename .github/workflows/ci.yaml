@@ -1,9 +1,8 @@
 name: CI
 
 on:
+  # Owner decision 2026-11-05: Actions run only on pushes to main, never on pull requests.
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
 
 jobs:
